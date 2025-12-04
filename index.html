@@ -171,6 +171,7 @@
         <p id="instruction" class="text-gray-600 mt-6">
           长按屏幕中间区域，看看你是什么猪！
         </p>
+        <p id="status" class="text-gray-500 text-sm mt-2"></p>
       </div>
       
       <!-- 结果区域 (初始隐藏) -->
@@ -358,6 +359,14 @@
       }
     ];
 
+    // 配置项
+    const config = {
+      // 每日可抽奖次数上限，可根据需要在部署前调整
+      dailyDrawLimit: 3,
+      // 记忆状态失效时间（小时），到期后用户可重新抽奖
+      memoryDurationHours: 24
+    };
+
     // DOM 元素
     const testArea = document.getElementById('test-area');
     const resultArea = document.getElementById('result-area');
@@ -366,6 +375,7 @@
     const progressPercentage = document.getElementById('progress-percentage');
     const pressHint = document.getElementById('press-hint');
     const instruction = document.getElementById('instruction');
+    const status = document.getElementById('status');
     const resultEmoji = document.getElementById('result-emoji');
     const resultTitle = document.getElementById('result-title');
     const resultDescription = document.getElementById('result-description');
@@ -382,27 +392,25 @@
     progressCircle.style.strokeDasharray = `${circumference} ${circumference}`;
     progressCircle.style.strokeDashoffset = circumference;
     
-    // 检查是否已有结果
-    let savedResult = null;
-    try {
-      savedResult = localStorage.getItem('pigTestResult');
-      if (savedResult) {
-        showResult(JSON.parse(savedResult));
-      }
-    } catch (error) {
-      console.error('读取本地存储失败:', error);
-      // 清除可能损坏的数据
-      localStorage.removeItem('pigTestResult');
-      savedResult = null;
-    }
+    // 检查是否已有结果/状态
+    const initialState = loadState();
+    applyState(initialState);
     
     // 长按开始事件
     function handleHoldStart(e) {
       // 阻止默认行为
       e.preventDefault();
       
-      // 如果已有结果，不执行任何操作
-      if (localStorage.getItem('pigTestResult')) return;
+      // 如果已有结果且未过期，阻止操作
+      const state = loadState();
+      if (state.lastResult && !state.expired && state.drawsToday >= config.dailyDrawLimit) {
+        instruction.textContent = `今天的抽奖次数已用完（${config.dailyDrawLimit} 次）`;
+        return;
+      }
+      if (state.lastResult && !state.expired) {
+        instruction.textContent = '记忆状态生效中，暂无法重复抽奖';
+        return;
+      }
       
       isHolding = true;
       startTime = Date.now();
@@ -423,7 +431,8 @@
     // 长按结束事件
     function handleHoldEnd() {
       // 如果已有结果，不执行任何操作
-      if (localStorage.getItem('pigTestResult')) return;
+      const state = loadState();
+      if (state.lastResult && !state.expired) return;
       
       isHolding = false;
       clearInterval(progressInterval);
@@ -470,18 +479,26 @@
     // 生成随机结果
     function generateResult() {
       try {
+        // 读取状态并检查次数
+        const currentState = loadState();
+        if (!currentState.expired && currentState.drawsToday >= config.dailyDrawLimit) {
+          instruction.textContent = `今天的抽奖次数已用完（${config.dailyDrawLimit} 次）`;
+          resetProgress();
+          return;
+        }
+
         // 播放完成音效
         playSound('complete');
-        
+
         // 随机选择一个结果
         const randomIndex = Math.floor(Math.random() * pigResults.length);
         const result = pigResults[randomIndex];
-        
-        // 保存结果到本地存储
-        localStorage.setItem('pigTestResult', JSON.stringify(result));
-        
+
+        // 保存状态
+        const updatedState = saveStateWithResult(currentState, result);
+
         // 显示结果
-        showResult(result);
+        showResult(result, updatedState);
       } catch (error) {
         console.error('生成结果失败:', error);
         alert('生成结果失败，请重试！');
@@ -490,9 +507,9 @@
         instruction.textContent = '长按屏幕中间区域，看看你是什么猪！';
       }
     }
-    
+
     // 显示结果
-    function showResult(result) {
+    function showResult(result, state = loadState()) {
       // 隐藏测试区域，显示结果区域
       testArea.classList.add('hidden');
       resultArea.classList.remove('hidden');
@@ -519,6 +536,7 @@
         resultArea.style.opacity = '1';
         resultArea.style.transform = 'translateY(0)';
       }, 10);
+      updateStatus(state);
     }
     
     // 播放音效
@@ -559,20 +577,104 @@
     // 重新测试函数
     function handleRetest() {
       try {
-        // 清除本地存储结果
-        localStorage.removeItem('pigTestResult');
-        
+        const clearedState = clearState();
+
         // 重置进度条
         resetProgress();
-        
+
         // 显示测试区域，隐藏结果区域
         testArea.classList.remove('hidden');
         resultArea.classList.add('hidden');
-        
+
         // 重置提示文字
         instruction.textContent = '长按屏幕中间区域，看看你是什么猪！';
+        updateStatus(clearedState);
       } catch (error) {
         console.error('重新测试失败:', error);
+      }
+    }
+
+    // 状态相关工具函数
+    function loadState() {
+      try {
+        const raw = localStorage.getItem('pigTestState');
+        if (!raw) return createDefaultState(false);
+
+        const parsed = JSON.parse(raw);
+        const expired = isExpired(parsed);
+        if (expired) {
+          clearState();
+          return createDefaultState(true);
+        }
+
+        return { ...parsed, expired: false };
+      } catch (error) {
+        console.error('读取本地存储失败:', error);
+        clearState();
+        return createDefaultState(false);
+      }
+    }
+
+    function saveStateWithResult(state, result) {
+      const now = Date.now();
+      const today = new Date();
+      const todayKey = today.toDateString();
+
+      const drawsToday = state.lastDrawDate === todayKey ? (state.drawsToday + 1) : 1;
+
+      const newState = {
+        lastResult: result,
+        drawsToday,
+        lastDrawDate: todayKey,
+        expiresAt: now + config.memoryDurationHours * 60 * 60 * 1000,
+        expired: false
+      };
+
+      localStorage.setItem('pigTestState', JSON.stringify(newState));
+      return newState;
+    }
+
+    function clearState() {
+      const defaultState = createDefaultState(false);
+      localStorage.removeItem('pigTestState');
+      return defaultState;
+    }
+
+    function createDefaultState(markExpired) {
+      return {
+        lastResult: null,
+        drawsToday: 0,
+        lastDrawDate: null,
+        expiresAt: null,
+        expired: markExpired
+      };
+    }
+
+    function isExpired(state) {
+      if (!state || !state.expiresAt) return false;
+      return Date.now() > state.expiresAt;
+    }
+
+    function updateStatus(state) {
+      const remaining = Math.max(config.dailyDrawLimit - state.drawsToday, 0);
+      const today = new Date().toDateString();
+      const isToday = state.lastDrawDate === today;
+      const expiresAtText = state.expiresAt ? new Date(state.expiresAt).toLocaleString() : '—';
+
+      if (state.expired) {
+        status.textContent = `状态已过期，可重新开始测试。今日剩余次数：${config.dailyDrawLimit}`;
+        return;
+      }
+
+      const remainingText = isToday ? `今日剩余次数：${remaining}` : `今日剩余次数：${config.dailyDrawLimit}`;
+      status.textContent = `记忆状态将在 ${expiresAtText} 失效。${remainingText}`;
+    }
+
+    function applyState(state) {
+      if (state.lastResult && !state.expired) {
+        showResult(state.lastResult, state);
+      } else {
+        updateStatus(state);
       }
     }
     
